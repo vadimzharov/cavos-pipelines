@@ -63,7 +63,7 @@ jobs:
       - name: Start VM if runner is offline
         if: steps.runner_ready.outputs.runner_ready == 'false'
         run: |
-          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/${{ vars.VMORUNNERVM }}/start?namespace=vm-test" \
+          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/${{ vars.VMORUNNERVM }}/start?namespace=${{ vars.VMORUNNERVMNS }}" \
             -H "ApiKey: ${{ secrets.PALETTE_API_KEY }}" \
             -H "ProjectUid: ${{ vars.PROJECTID }}"
           echo "Waiting for runner to come online..."
