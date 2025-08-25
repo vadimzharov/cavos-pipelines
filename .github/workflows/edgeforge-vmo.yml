@@ -1,0 +1,181 @@
+name: EdgeForge - build all on VMO runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      edge_version:
+        description: 'Edge Version of CanvOS'
+        required: true
+        default: 'v4.7.4'
+      os_distribution:
+        description: 'OS Distribution'
+        required: true
+        default: 'ubuntu'
+      os_version:
+        description: 'OS Version'
+        required: true
+        default: '22.04'
+      image_repo:
+        description: 'Image Repository/Github Project'
+        required: true
+        default: 'vadimzharov/edge-k8s'
+      image_registry:
+        description: 'Container Registry (must be OCI compliant) to store Artifacts'
+        required: true
+        default: 'quay.io'
+      k8s_distribution:
+        description: 'Kubernetes Distribution'
+        required: true
+        default: 'kubeadm'
+      k8s_version:
+        description: 'Kubernetes Version'
+        required: true
+        default: '1.32.4'
+      edge_preset:
+        description: 'Name of the Edge Preset to use'
+        required: true
+        default: '4-7-basic'
+      vm_count:
+        description: 'Number of VMs to create'
+        required: true
+        default: '1'
+
+jobs:
+  prepare_runner:
+    runs-on: ubuntu-latest
+    outputs:
+      runner_ready: ${{ steps.runner_ready.outputs.runner_ready }}
+    steps:
+      - name: Check if self-hosted runner is online
+        id: runner_ready
+        run: |
+          RUNNERS_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners")
+          RUNNER_STATUS=$(echo "$RUNNERS_JSON" | jq -r '.runners // [] | map(select(.name=="${{ vars.VMORUNNERVM }}")) | .[0].status // empty')
+          if [ "$RUNNER_STATUS" = "online" ]; then
+            echo "runner_ready=true" >> $GITHUB_OUTPUT
+          else
+            echo "runner_ready=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Debug runner_ready output
+        run: echo "runner_ready=${{ steps.runner_ready.outputs.runner_ready }}"
+
+      - name: Start VM if runner is offline
+        if: steps.runner_ready.outputs.runner_ready == 'false'
+        run: |
+          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/${{ vars.VMORUNNERVM }}/start?namespace=vm-test" \
+            -H "ApiKey: ${{ secrets.PALETTE_API_KEY }}" \
+            -H "ProjectUid: ${{ vars.PROJECTID }}"
+          echo "Waiting for runner to come online..."
+          for i in {1..30}; do
+            sleep 10
+            RUNNERS_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runners")
+            RUNNER_STATUS=$(echo "$RUNNERS_JSON" | jq -r '.runners // [] | map(select(.name=="${{ vars.VMORUNNERVM }}")) | .[0].status // empty')
+            if [ "$RUNNER_STATUS" = "online" ]; then
+              echo "Runner is online!"
+              break
+            fi
+            echo "Waiting... ($i)"
+          done
+
+  build:
+    needs: prepare_runner
+    runs-on: [self-hosted, vmo-runner]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: earthly/actions-setup@v1
+        with:
+          version: "latest"
+
+      - name: Clone CanvOS Repository
+        run: |
+          git clone https://github.com/spectrocloud/CanvOS.git
+          cd CanvOS
+          git tag
+          git checkout ${{ github.event.inputs.edge_version || 'v4.6.9' }}
+      
+      - name: Create .arg file
+        working-directory: ./CanvOS
+        run: |
+          cat << EOF > .arg
+          CUSTOM_TAG=${{ github.event.inputs.edge_preset || 'github-action' }}
+          IMAGE_REGISTRY=${{ github.event.inputs.image_registry || 'ghcr.io' }}
+          OS_DISTRIBUTION=${{ github.event.inputs.os_distribution || 'ubuntu' }}
+          IMAGE_REPO=${{ github.event.inputs.image_repo || 'canvos-automation' }}
+          OS_VERSION=${{ github.event.inputs.os_version || '22.04' }}
+          K8S_DISTRIBUTION=${{ github.event.inputs.k8s_distribution || 'k3s' }}
+          ISO_NAME=${{ github.event.inputs.edge_preset || 'palette-edge-installer' }}
+          K8S_VERSION=${{ github.event.inputs.k8s_version || '1.32.1' }}
+          TWO_NODE=false
+          ARCH=amd64
+          UPDATE_KERNEL=false
+          EOF
+          
+          cat .arg
+      
+      - name: Generate user-data file from template
+        run: |
+          export EDGE_HOST_TOKEN="${{ secrets.EDGE_HOST_TOKEN }}"
+          export IMAGE_REGISTRY="${{ github.event.inputs.image_registry }}"
+          export REGISTRY_USERNAME="${{ secrets.REGISTRY_USERNAME }}"
+          export REGISTRY_PASSWORD="${{ secrets.REGISTRY_PASSWORD }}"
+          envsubst < presets/${{ github.event.inputs.edge_preset }}/user-data.template > ./CanvOS/user-data
+          cat ./CanvOS/user-data
+
+      - name: Build Edge ISO
+        working-directory: ./CanvOS
+        run: |
+          earthly +iso
+
+      - name: Install MinIO Client
+        run: |
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          sudo mv mc /usr/local/bin/
+
+      - name: Upload ISO and SHA256 to S3 Minio with mc
+        run: |
+          mc alias set minio "$AWS_S3_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+          ISO_FILE="./CanvOS/build/${{ github.event.inputs.edge_preset || 'palette-edge-installer' }}.iso"
+          SHA_FILE="$ISO_FILE.sha256"
+          BUCKET="${{ secrets.BUCKET_ISO_FILE }}"
+          echo "Generating SHA256 for $ISO_FILE ..."
+          sha256sum "$ISO_FILE" | awk '{print $1}' > "$SHA_FILE"
+          echo "Uploading ${ISO_FILE} to minio/${BUCKET}/"
+          mc cp "$ISO_FILE" "minio/$BUCKET/"
+          echo "Uploading ${SHA_FILE} to minio/${BUCKET}/"
+          mc cp "$SHA_FILE" "minio/$BUCKET/"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_S3_ENDPOINT: ${{ secrets.AWS_S3_ENDPOINT }}
+          BUCKET_ISO_FILE: ${{ secrets.BUCKET_ISO_FILE }}
+          
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ github.event.inputs.image_registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build Edge Container Images
+        working-directory: ./CanvOS
+        run: |
+          earthly --ci --push +build-provider-images
+
+      - name: Verify Artifacts
+        working-directory: ./CanvOS
+        run: |
+          docker images --filter=reference=" ${{ github.event.inputs.image_registry }}/${{ github.event.inputs.image_repo || 'canvos-automation' }}:*${{ github.event.inputs.edge_preset || 'github-action' }}*"
+
+
+  shutdown_vm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Shutdown VM after build
+        run: |
+          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/ghr-01/stop?namespace=vm-test" \
+            -H "ApiKey: ${{ secrets.PALETTE_API_KEY }}" \
+            -H "ProjectUid: ${{ vars.PROJECTID }}"

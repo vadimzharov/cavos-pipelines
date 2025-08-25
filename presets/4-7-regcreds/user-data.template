@@ -1,0 +1,22 @@
+#cloud-config
+
+stylus:
+  site:
+    edgeHostToken: ${EDGE_HOST_TOKEN}
+  registryCredentials:
+    domain: "${IMAGE_REGISTRY}"
+    username: "${REGISTRY_USERNAME}"
+    password: "${REGISTRY_PASSWORD}"
+    insecure: true
+
+install:
+  poweroff: true
+
+stages:
+  initramfs:
+  - name: "Core system setup"
+    users:
+      spectro:
+        groups:
+          - admin
+        passwd: vadim
