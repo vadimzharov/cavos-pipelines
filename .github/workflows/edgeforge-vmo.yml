@@ -176,6 +176,6 @@ jobs:
     steps:
       - name: Shutdown VM after build
         run: |
-          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/ghr-01/stop?namespace=vm-test" \
+          curl -X PUT "https://api.spectrocloud.com/v1/spectroclusters/${{ vars.VMOCLUSTERID }}/vms/${{ vars.VMORUNNERVM }}/stop?namespace=${{ vars.VMORUNNERVMNS }}" \
             -H "ApiKey: ${{ secrets.PALETTE_API_KEY }}" \
             -H "ProjectUid: ${{ vars.PROJECTID }}"
